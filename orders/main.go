@@ -1,7 +1,7 @@
-// Orders вЂ” РЅР°РёРІРЅР°СЏ СЂРµР°Р»РёР·Р°С†РёСЏ.
+// Orders — наивная реализация.
 //
-// РћС„РѕСЂРјР»РµРЅРёРµ Р·Р°РєР°Р·Р°: Р·Р°СЂРµР·РµСЂРІРёСЂРѕРІР°С‚СЊ С‚РѕРІР°СЂ РІ Inventory, СЃРїРёСЃР°С‚СЊ РґРµРЅСЊРіРё РІ
-// Payment, Р·Р°РїРёСЃР°С‚СЊ Р·Р°РєР°Р· РІ Р±Р°Р·Сѓ. РџРѕРєР° Payment Рё Inventory СЂР°Р±РѕС‚Р°СЋС‚ Р±РµР· РѕС‚РєР°Р·РѕРІ, РІСЃС‘ СЂР°Р±РѕС‚Р°РµС‚.
+// Оформление заказа: зарезервировать товар в Inventory, списать деньги в
+// Payment, записать заказ в базу. Пока Payment и Inventory работают без отказов, всё работает.
 package main
 
 import (
@@ -13,9 +13,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -77,10 +79,12 @@ func main() {
 	}
 	db, err := connect(mustEnv("DATABASE_URL"))
 	if err != nil {
-		slog.Error("Р±Р°Р·Р°", "err", err)
+		slog.Error("база", "err", err)
 		os.Exit(1)
 	}
 	a.db = db
+	// Восстанавливаем заказы, оставшиеся pending после перезапуска.
+	a.recoverPendingOrders()
 
 	mux := http.NewServeMux()
 	go func() {
@@ -105,14 +109,14 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	slog.Info("orders: СЃР»СѓС€Р°СЋ", "port", port)
+	slog.Info("orders: слушаю", "port", port)
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		slog.Error("server", "err", err)
 		os.Exit(1)
 	}
 }
 
-// connect Р¶РґС‘С‚ Р±Р°Р·Сѓ: РѕРЅР° РјРѕР¶РµС‚ РїРѕРґРЅРёРјР°С‚СЊСЃСЏ РґРѕР»СЊС€Рµ СЃРµСЂРІРёСЃР°.
+// connect ждёт базу: она может подниматься дольше сервиса.
 func connect(url string) (*pgxpool.Pool, error) {
 	var lastErr error
 	for range 60 {
@@ -124,10 +128,62 @@ func connect(url string) (*pgxpool.Pool, error) {
 			db.Close()
 		}
 		lastErr = err
-		slog.Info("Р±Р°Р·Р° РЅРµРґРѕСЃС‚СѓРїРЅР°, Р¶РґСѓ", "err", err)
+		slog.Info("база недоступна, жду", "err", err)
 		time.Sleep(time.Second)
 	}
 	return nil, lastErr
+}
+
+func (a *app) recoverPendingOrders() {
+	ctx := context.Background()
+
+	rows, err := a.db.Query(ctx, `
+        SELECT id, items, amount_cents
+        FROM orders
+        WHERE status = 'pending'
+        ORDER BY created_at
+    `)
+	if err != nil {
+		slog.Error("recover pending orders", "error", err)
+		return
+	}
+
+	type pendingOrder struct {
+		id     string
+		items  []byte
+		amount int64
+	}
+
+	var pending []pendingOrder
+
+	for rows.Next() {
+		var order pendingOrder
+		if err := rows.Scan(&order.id, &order.items, &order.amount); err != nil {
+			slog.Error("read pending order", "error", err)
+			rows.Close()
+			return
+		}
+		pending = append(pending, order)
+	}
+
+	if err := rows.Err(); err != nil {
+		slog.Error("iterate pending orders", "error", err)
+		rows.Close()
+		return
+	}
+	rows.Close()
+
+	for _, order := range pending {
+		var items []Item
+		if err := json.Unmarshal(order.items, &items); err != nil {
+			slog.Error("decode pending order", "id", order.id, "error", err)
+			continue
+		}
+
+		go a.processOrder(order.id, items, order.amount)
+	}
+
+	slog.Info("pending orders recovery started", "count", len(pending))
 }
 
 func (a *app) createOrder(w http.ResponseWriter, r *http.Request) {
@@ -151,8 +207,8 @@ func (a *app) createOrder(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// РЎРЅР°С‡Р°Р»Р° СЃРѕС…СЂР°РЅСЏРµРј Р·Р°РєР°Р·: РґР°Р¶Рµ РїСЂРё СЃР±РѕРµ РІРЅРµС€РЅРµРіРѕ СЃРµСЂРІРёСЃР°
-	// РѕРЅ РѕСЃС‚Р°РЅРµС‚СЃСЏ РІ Р±Р°Р·Рµ СЃРѕ СЃС‚Р°С‚СѓСЃРѕРј pending.
+	// Сначала сохраняем заказ: даже при сбое внешнего сервиса
+	// он останется в базе со статусом pending.
 	_, err = a.db.Exec(ctx,
 		`INSERT INTO orders (id, user_id, status, amount_cents, items)
 		 VALUES ($1, $2, 'pending', $3, $4)`,
@@ -164,76 +220,91 @@ func (a *app) createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Р•СЃР»Рё СЂРµР·РµСЂРІРёСЂРѕРІР°РЅРёРµ РІСЂРµРјРµРЅРЅРѕ РЅРµРґРѕСЃС‚СѓРїРЅРѕ, СЃРѕС…СЂР°РЅСЏРµРј pending.
-	if err := a.reserve(id, req.Items); err != nil {
-		slog.Warn("reserve failed", "id", id, "error", err)
-		writeJSON(w, http.StatusCreated, map[string]string{"id": id, "status": "pending"})
-		return
-	}
+	go a.processOrder(id, req.Items, amount)
 
-	declined, err := a.charge(id, amount)
-	if err != nil {
-		// РќРµР»СЊР·СЏ СѓРІРµСЂРµРЅРЅРѕ СЃС‡РёС‚Р°С‚СЊ РїР»Р°С‚С‘Р¶ РЅРµСѓСЃРїРµС€РЅС‹Рј:
-		// РѕРїРµСЂР°С†РёСЏ РјРѕРіР»Р° Р·Р°РІРµСЂС€РёС‚СЊСЃСЏ, Р° РѕС‚РІРµС‚ РїРѕС‚РµСЂСЏС‚СЊСЃСЏ.
-		slog.Warn("payment result unknown", "id", id, "error", err)
-		writeJSON(w, http.StatusCreated, map[string]string{"id": id, "status": "pending"})
-		return
-	}
+	writeJSON(w, http.StatusCreated, map[string]string{
+		"id":     id,
+		"status": "pending",
+	})
+}
 
-	status := "paid"
-	if declined {
-		a.release(id)
-		status = "rejected"
-	}
+func (a *app) processOrder(id string, items []Item, amount int64) {
+	ctx := context.Background()
 
-	if status == "paid" {
-		tx, txErr := a.db.Begin(ctx)
-		if txErr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
-			return
+	// Ограничиваем частоту обращений к Inventory и Payment.
+	// Не освобождаем резерв и не помечаем заказ rejected при неизвестном результате оплаты.
+	for attempt := 0; attempt < 60; attempt++ {
+		if attempt > 0 {
+			time.Sleep(2 * time.Second)
 		}
 
-		_, txErr = tx.Exec(ctx,
-			`UPDATE orders SET status = 'paid' WHERE id = $1`,
-			id,
-		)
-		if txErr == nil {
-			eventID := newID()
-			_, txErr = tx.Exec(ctx,
-				`INSERT INTO outbox_events (id, order_id) VALUES ($1, $2)`,
-				eventID, id,
-			)
-		}
-
-		if txErr != nil {
-			_ = tx.Rollback(ctx)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
-			return
-		}
-
-		if txErr = tx.Commit(ctx); txErr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
-			return
-		}
-	} else {
-		_, err = a.db.Exec(ctx,
-			`UPDATE orders SET status = $1 WHERE id = $2`,
-			status, id,
-		)
+		var status string
+		err := a.db.QueryRow(ctx,
+			`SELECT status FROM orders WHERE id = $1`, id,
+		).Scan(&status)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+			slog.Warn("read order status", "id", id, "error", err)
+			continue
+		}
+		if status != "pending" {
 			return
 		}
-	}
 
-	if err != nil {
-		slog.Error("update order status", "id", id, "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		if err := a.reserve(id, items); err != nil {
+			slog.Warn("reserve failed; will retry", "id", id, "attempt", attempt+1, "error", err)
+			continue
+		}
+
+		declined, err := a.charge(id, amount)
+		if err != nil {
+			slog.Warn("payment result unknown; will retry", "id", id, "attempt", attempt+1, "error", err)
+			continue
+		}
+
+		if declined {
+			a.release(id)
+			_, err = a.db.Exec(ctx,
+				`UPDATE orders SET status = 'rejected'
+ WHERE id = $1 AND status = 'pending'`, id)
+			if err != nil {
+				slog.Error("reject order", "id", id, "error", err)
+			}
+			return
+		}
+
+		tx, err := a.db.Begin(ctx)
+		if err != nil {
+			slog.Error("begin payment transaction", "id", id, "error", err)
+			continue
+		}
+
+		_, err = tx.Exec(ctx,
+			`UPDATE orders SET status = 'paid'
+ WHERE id = $1 AND status = 'pending'`, id)
+		if err != nil {
+			_ = tx.Rollback(ctx)
+			slog.Error("mark order paid", "id", id, "error", err)
+			continue
+		}
+
+		eventID := newID()
+		_, err = tx.Exec(ctx,
+			`INSERT INTO outbox_events (id, order_id) VALUES ($1, $2)`,
+			eventID, id)
+		if err != nil {
+			_ = tx.Rollback(ctx)
+			slog.Error("create outbox event", "id", id, "error", err)
+			continue
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			slog.Error("commit paid order", "id", id, "error", err)
+			continue
+		}
 		return
 	}
 
-	slog.Info("order", "id", id, "status", status)
-	writeJSON(w, http.StatusCreated, map[string]string{"id": id, "status": status})
+	slog.Warn("order remains pending after retry limit", "id", id)
 }
 
 func (a *app) fail(w http.ResponseWriter, id string, err error) {
@@ -293,7 +364,7 @@ func (a *app) handleDelivery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if tag.RowsAffected() == 0 {
-		// РЎРѕР±С‹С‚РёРµ СѓР¶Рµ РѕР±СЂР°Р±РѕС‚Р°РЅРѕ: РїРѕРІС‚РѕСЂРЅРѕРµ РЅР°С‡РёСЃР»РµРЅРёРµ РЅРµ РЅСѓР¶РЅРѕ.
+		// Событие уже обработано: повторное начисление не нужно.
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -427,24 +498,104 @@ func (a *app) release(id string) {
 
 var errPayment = errors.New("payment")
 
-// charge СЃРїРёСЃС‹РІР°РµС‚ РґРµРЅСЊРіРё; declined вЂ” Р±Р°РЅРє РѕС‚РєР°Р·Р°Р».
-func (a *app) charge(id string, amount int64) (declined bool, err error) {
-	declined, err = a.chargeOnce(id, amount)
+var (
+	paymentSlots = make(chan struct{}, 8)
+	paymentMu    sync.Mutex
+	paymentUntil time.Time
+	paymentProbe bool
+)
+
+func (a *app) charge(id string, amount int64) (bool, error) {
+	paymentMu.Lock()
+	now := time.Now()
+
+	if now.Before(paymentUntil) {
+		paymentMu.Unlock()
+		return false, fmt.Errorf("payment circuit open")
+	}
+
+	isProbe := !paymentUntil.IsZero()
+	if isProbe {
+		if paymentProbe {
+			paymentMu.Unlock()
+			return false, fmt.Errorf("payment probe in progress")
+		}
+		paymentProbe = true
+	}
+	paymentMu.Unlock()
+
+	select {
+	case paymentSlots <- struct{}{}:
+		defer func() { <-paymentSlots }()
+	default:
+		if isProbe {
+			paymentMu.Lock()
+			paymentProbe = false
+			paymentMu.Unlock()
+		}
+		return false, fmt.Errorf("payment concurrency limit reached")
+	}
+
+	paymentMu.Lock()
+	if time.Now().Before(paymentUntil) && !isProbe {
+		paymentMu.Unlock()
+		return false, fmt.Errorf("payment circuit open")
+	}
+	paymentMu.Unlock()
+
+	declined, err := a.chargeOnce(id, amount)
 	if err == nil {
+		if isProbe {
+			paymentMu.Lock()
+			paymentUntil = time.Time{}
+			paymentProbe = false
+			paymentMu.Unlock()
+		}
 		return declined, nil
 	}
 
-	// Ответ мог потеряться уже после успешного списания.
-	// Повторяем запрос с тем же Idempotency-Key.
-	slog.Warn("payment result uncertain; retrying idempotently", "id", id, "err", err)
+	// Сетевой тайм-аут: результат платежа неизвестен.
+	// Не создаём немедленную волну повторных запросов.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		paymentMu.Lock()
+		paymentUntil = time.Now().Add(10 * time.Second)
+		paymentProbe = false
+		paymentMu.Unlock()
+		return false, fmt.Errorf("payment timeout; retry later: %w", err)
+	}
+
+	// HTTP-ошибки, например 500, повторяем с тем же ключом.
+	slog.Warn("payment result uncertain; retrying idempotently",
+		"id", id, "err", err)
 
 	declined, retryErr := a.chargeOnce(id, amount)
 	if retryErr == nil {
+		if isProbe {
+			paymentMu.Lock()
+			paymentUntil = time.Time{}
+			paymentProbe = false
+			paymentMu.Unlock()
+		}
 		return declined, nil
 	}
 
-	// Не утверждаем, что платёж отклонён, если результат неизвестен.
-	return false, fmt.Errorf("payment result unknown: first attempt: %v; retry: %w", err, retryErr)
+	if errors.As(retryErr, &netErr) && netErr.Timeout() {
+		paymentMu.Lock()
+		paymentUntil = time.Now().Add(10 * time.Second)
+		paymentProbe = false
+		paymentMu.Unlock()
+	} else if isProbe {
+		paymentMu.Lock()
+		paymentUntil = time.Time{}
+		paymentProbe = false
+		paymentMu.Unlock()
+	}
+
+	return false, fmt.Errorf(
+		"payment result unknown: first attempt: %v; retry: %w",
+		err, retryErr,
+	)
 }
 
 func (a *app) chargeOnce(id string, amount int64) (bool, error) {
@@ -490,7 +641,7 @@ func callWithHeaders(method, url string, body any, headers map[string]string) (i
 		req.Header.Set(key, value)
 	}
 
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err
@@ -529,7 +680,7 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 func mustEnv(k string) string {
 	v := os.Getenv(k)
 	if v == "" {
-		slog.Error("РЅРµ Р·Р°РґР°РЅР° РїРµСЂРµРјРµРЅРЅР°СЏ РѕРєСЂСѓР¶РµРЅРёСЏ", "name", k)
+		slog.Error("не задана переменная окружения", "name", k)
 		os.Exit(1)
 	}
 	return v
